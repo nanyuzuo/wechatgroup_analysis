@@ -15,6 +15,12 @@ from datetime import datetime
 import matplotlib.colors as mcolors
 from matplotlib.gridspec import GridSpec
 from wordcloud import WordCloud
+import geopandas as gpd
+import requests
+import zipfile
+import io
+import json
+from shapely.geometry import Polygon, MultiPolygon
 
 class WeChatGroupAnalyzer:
     def __init__(self):
@@ -351,7 +357,8 @@ class WeChatGroupAnalyzer:
             member = ' '.join(part.strip() for part in member.split())  # 分割并重组，确保只有单个空格
             
             # 判断马哥教育成员
-            if '马哥' in member or '班' in member or '豆' in member:
+            if ('马哥' in member or '班' in member or '豆' in member or 
+                '老师' in member or 'magedu' in member.lower() or '助手' in member):
                 self.admin_members.append(member)
                 continue
             
@@ -457,6 +464,87 @@ class WeChatGroupAnalyzer:
             for member in self.unknown_members:
                 print(f"- {member}")
     
+    def clean_text_for_image(self, text):
+        """清理文本，移除emoji和其他特殊字符"""
+        # 移除emoji和其他特殊字符
+        cleaned_text = ''
+        for char in text:
+            # 检查字符是否是常规文本字符（包括中文、英文、数字、常用标点）
+            if (
+                '\u4e00' <= char <= '\u9fff' or  # 中文字符
+                '\u0020' <= char <= '\u007E' or  # ASCII可打印字符
+                char in '，。！？、；：''""（）《》【】￥'  # 常用中文标点
+            ):
+                cleaned_text += char
+        return cleaned_text
+
+    def create_text_image(self, text, width=1200, font_size=24):
+        """将文本转换为图片"""
+        # 设置字体
+        font = ImageFont.truetype("simhei.ttf", font_size)
+        font_small = ImageFont.truetype("simhei.ttf", font_size - 4)
+        
+        # 计算行高和边距
+        line_height = font_size * 1.5
+        padding = 40
+        
+        # 分割文本行
+        lines = text.split('\n')
+        
+        # 计算每行实际宽度和换行
+        wrapped_lines = []
+        for line in lines:
+            # 清理文本中的emoji
+            line = self.clean_text_for_image(line)
+            
+            # 缩进处理
+            indent = len(line) - len(line.lstrip())
+            indent_space = "  " * indent
+            
+            # 处理实际内容
+            content = line.lstrip()
+            
+            # 根据内容类型设置字体和颜色
+            if content.startswith('==='):  # 主标题
+                current_font = ImageFont.truetype("simhei.ttf", font_size + 4)
+                color = '#FF6B6B'  # 主题色
+            elif content.startswith('【'):  # 分类标题
+                current_font = ImageFont.truetype("simhei.ttf", font_size + 2)
+                color = '#4ECDC4'  # 次要主题色
+            elif content.startswith('- '):  # 一级列表项
+                current_font = font
+                color = '#2C3E50'  # 深灰色
+            elif content.startswith('* '):  # 二级列表项
+                current_font = font_small
+                color = '#5D6D7E'  # 中灰色
+            else:  # 普通文本
+                current_font = font
+                color = '#34495E'  # 标准文本色
+            
+            # 处理缩进和行宽
+            if content.startswith('*'):
+                line_width = width - padding * 3
+            else:
+                line_width = width - padding * 2
+            
+            # 添加到行列表
+            wrapped_lines.append((indent_space + content, current_font, color))
+        
+        # 计算所需图片高度
+        height = int(len(wrapped_lines) * line_height + padding * 2)
+        
+        # 创建图片
+        image = Image.new('RGB', (width, height), '#FFFFFF')  # 纯白背景
+        draw = ImageDraw.Draw(image)
+        
+        # 绘制文本
+        y = padding
+        for line, line_font, color in wrapped_lines:
+            draw.text((padding, y), line, font=line_font, fill=color)
+            y += line_height
+        
+        return image
+
     def generate_text_result(self):
         """生成文本统计结果"""
         result = []
@@ -541,23 +629,104 @@ class WeChatGroupAnalyzer:
         
         return person
 
-    def create_charts(self):
-        """创建统计图表"""
+    def convert_echarts_to_geojson(self, echarts_data):
+        """将ECharts地图数据转换为GeoJSON格式"""
+        features = []
+        
+        # 解析JSON数据
+        data = json.loads(echarts_data)
+        
+        for feature in data['features']:
+            # 获取省份名称
+            properties = {'name': feature['properties']['name']}
+            
+            # 处理几何数据
+            geometry = feature['geometry']
+            coordinates = geometry['coordinates']
+            
+            if geometry['type'] == 'Polygon':
+                # 单个多边形
+                geom = Polygon(coordinates[0])
+            elif geometry['type'] == 'MultiPolygon':
+                # 多个多边形
+                polygons = [Polygon(poly[0]) for poly in coordinates]
+                geom = MultiPolygon(polygons)
+            
+            # 创建GeoJSON格式的要素
+            feature_dict = {
+                'type': 'Feature',
+                'properties': properties,
+                'geometry': {
+                    'type': geometry['type'],
+                    'coordinates': coordinates
+                }
+            }
+            features.append(feature_dict)
+        
+        # 创建完整的GeoJSON对象
+        geojson = {
+            'type': 'FeatureCollection',
+            'features': features
+        }
+        
+        return geojson
+
+    def download_map_data(self):
+        """下载中国地图数据"""
+        data_dir = 'data/china'
+        map_file = os.path.join(data_dir, 'china.geojson')
+        
+        if not os.path.exists(map_file):
+            print("正在下载地图数据...")
+            try:
+                # 使用阿里云数据可视化的地图数据
+                url = "https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json"
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                
+                # 保存地图数据
+                os.makedirs(data_dir, exist_ok=True)
+                with open(map_file, 'w', encoding='utf-8') as f:
+                    f.write(response.text)
+                
+                print("地图数据下载完成！")
+            except Exception as e:
+                print(f"下载地图数据时出错：{str(e)}")
+                print("请手动下载地图数据：")
+                print("1. 访问 https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json")
+                print("2. 下载 GeoJSON 格式的地图数据")
+                print("3. 保存为 china.geojson 文件")
+                print("4. 放到 'data/china' 目录")
+                return False
+                
+        return True
+
+    def generate_statistics_charts(self):
+        """生成统计图表"""
+        # 设置中文字体
         plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
         plt.rcParams['axes.unicode_minus'] = False    # 解决负号显示问题
         
-        # 创建图表
-        fig, ax = plt.subplots(figsize=(15, 10))
+        # 创建一个更大的图表
+        plt.figure(figsize=(20, 30), dpi=300)  # 调整整体尺寸比例
+        
+        # 设置网格布局，调整子图之间的间距和相对大小
+        gs = GridSpec(2, 1, height_ratios=[1, 1.2], hspace=0.3)
+        
+        # 绘制条形图
+        ax1 = plt.subplot(gs[0])
         
         # 准备数据
         categories = []
         counts = []
+        colors = []  # 用于存储每个条形的颜色
         
-        # 1. 马哥教育成员
+        # 1. 马哥教育成员（绿色）
         categories.append('马哥教育成员')
         counts.append(len(self.admin_members))
+        colors.append('#2ECC71')  # 绿色
         
-        # 2. 各省份成员（按人数降序）
+        # 2. 各省份成员（蓝色）
         province_data = []
         for province, data in self.province_city_members.items():
             province_data.append((province, data['total']))
@@ -568,118 +737,208 @@ class WeChatGroupAnalyzer:
         for province, count in province_data:
             categories.append(province)
             counts.append(count)
+            colors.append('#3498DB')  # 蓝色
         
-        # 3. 国外成员
+        # 3. 国外成员（橙色）
         categories.append('国外成员')
         counts.append(len(self.foreign_members))
+        colors.append('#E67E22')  # 橙色
         
-        # 4. 未知地区人员
+        # 4. 未知地区人员（红色）
         categories.append('未知地区人员')
         counts.append(len(self.unknown_members))
+        colors.append('#E74C3C')  # 红色
         
         # 创建水平条形图
-        y_pos = np.arange(len(categories))
+        bars = ax1.barh(categories, counts, color=colors)
         
-        # 设置统一的浅蓝色，马哥教育成员使用红色
-        colors = ['#FF6B6B' if i == 0 else '#5B9BD5' for i in range(len(categories))]
-        bars = ax.barh(y_pos, counts, color=colors)
-        
-        # 设置图表样式
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(categories, fontsize=10)
-        ax.set_xlabel('人数', fontsize=12)
-        
-        # 设置背景色和网格样式
-        ax.set_facecolor('#FFFFFF')
-        fig.patch.set_facecolor('#FFFFFF')
-        ax.grid(axis='x', linestyle='--', alpha=0.3, color='#E5E5E5')
-        
-        # 在条形图右端添加数值标签
-        for i, bar in enumerate(bars):
+        # 在条形图上添加数值标签
+        for bar in bars:
             width = bar.get_width()
-            ax.text(width + 0.5, bar.get_y() + bar.get_height()/2,
-                   f'{int(width)}人',
-                   ha='left', va='center', fontsize=10)
+            ax1.text(width, bar.get_y() + bar.get_height()/2,
+                    f'{int(width)}人',
+                    va='center', ha='left', fontsize=10)
         
-        # 计算总人数
-        total_members = sum(counts)
+        # 设置标题和标签
+        ax1.set_title('成员地区分布', pad=20, fontsize=16)
+        ax1.set_xlabel('人数', fontsize=12)
         
-        # 设置标题和总人数说明
-        plt.title('成员分布情况\n本群共{}人，构成情况如图'.format(total_members), 
-                 pad=20, fontsize=14, loc='center')
+        # 调整条形图的样式
+        ax1.grid(True, axis='x', linestyle='--', alpha=0.7)
+        ax1.set_axisbelow(True)  # 将网格线置于数据下方
+        
+        # 设置y轴标签的字体大小
+        ax1.tick_params(axis='y', labelsize=10)
+        
+        # 创建地图热力图子图
+        ax2 = plt.subplot(gs[1])
+        
+        try:
+            # 读取地图数据
+            china = gpd.read_file('data/china/china.geojson')
+            
+            # 创建省份人数的字典
+            province_counts = {province: data['total'] for province, data in self.province_city_members.items()}
+            
+            # 将省份名称标准化（去除"省"、"自治区"、"特别行政区"等后缀）
+            province_mapping = {
+                '内蒙古自治区': '内蒙古',
+                '广西壮族自治区': '广西',
+                '西藏自治区': '西藏',
+                '新疆维吾尔自治区': '新疆',
+                '宁夏回族自治区': '宁夏',
+                '香港特别行政区': '香港',
+                '澳门特别行政区': '澳门',
+                '北京': '北京市',
+                '上海': '上海市',
+                '天津': '天津市',
+                '重庆': '重庆市'
+            }
+            
+            # 为GeoDataFrame添加人数数据
+            china['value'] = china['name'].apply(lambda x: province_counts.get(province_mapping.get(x, x.rstrip('市省自治区特别行政区')), 0))
+            
+            # 设置颜色映射
+            vmin = 0
+            vmax = max(province_counts.values()) if province_counts else 1
+            norm = plt.Normalize(vmin=vmin, vmax=vmax)
+            cmap = plt.cm.YlOrRd  # 使用黄橙红配色
+            
+            # 绘制地图
+            # 先绘制底图，所有省份使用浅灰色
+            china.plot(
+                ax=ax2,
+                facecolor='#F5F5F5',  # 浅灰色底色
+                edgecolor='#666666',  # 深灰色边界
+                linewidth=0.8  # 加粗边界线
+            )
+            
+            # 再绘制有人数的省份
+            china[china['value'] > 0].plot(
+                ax=ax2,
+                column='value',
+                cmap=cmap,
+                norm=norm,
+                edgecolor='#666666',  # 深灰色边界
+                linewidth=0.8  # 加粗边界线
+            )
+            
+            # 添加颜色条
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            cbar = plt.colorbar(sm, ax=ax2)
+            cbar.set_label('人数', fontsize=12)
+            
+            # 设置地图标题
+            ax2.set_title('群成员地理分布热力图', pad=20, fontsize=16)
+            
+            # 去除坐标轴
+            ax2.axis('off')
+            
+            # 特殊处理的省份（需要调整标签位置）
+            special_provinces = {
+                '北京市': {'xytext': (-20, 20)},
+                '天津市': {'xytext': (-20, -20)},
+                '上海市': {'xytext': (20, 0)},
+                '重庆市': {'xytext': (-20, 0)},
+                '香港特别行政区': {'xytext': (30, 0)},
+                '澳门特别行政区': {'xytext': (0, -20)},
+                '山东省': {'xytext': (20, 20)}
+            }
+            
+            # 添加省份标签
+            for idx, row in china.iterrows():
+                # 获取省份中心点坐标
+                centroid = row.geometry.centroid
+                province_name = row['name'].rstrip('市省自治区特别行政区')
+                value = province_counts.get(province_name, 0)
+                
+                if value > 0:  # 只标注有成员的省份
+                    label = f"{province_name}\n{value}人"
+                    
+                    # 获取特殊省份的标签位置偏移
+                    offset = special_provinces.get(row['name'], {'xytext': (3, 3)})['xytext']
+                    
+                    # 根据人数设置文本框的颜色
+                    if value >= vmax * 0.7:  # 如果人数较多（超过最大值的70%）
+                        text_color = 'white'  # 使用白色文字
+                        box_color = '#333333'  # 使用深色背景
+                        box_alpha = 0.9  # 增加不透明度
+                    else:
+                        text_color = 'black'
+                        box_color = 'white'
+                        box_alpha = 0.9
+                    
+                    ax2.annotate(
+                        label,
+                        xy=(centroid.x, centroid.y),
+                        xytext=offset,
+                        textcoords="offset points",
+                        ha='center',
+                        va='center',
+                        fontsize=10,
+                        color=text_color,
+                        bbox=dict(
+                            boxstyle="round,pad=0.3",
+                            fc=box_color,
+                            ec='#333333',  # 深色边框
+                            alpha=box_alpha,
+                            linewidth=1
+                        ),
+                        arrowprops=dict(
+                            arrowstyle="->",
+                            connectionstyle="arc3,rad=0.2",
+                            color='#666666'
+                        ) if offset != (3, 3) else None  # 只为偏移的标签添加指向线
+                    )
+            
+        except Exception as e:
+            print(f"绘制地图时出错：{str(e)}")
+            ax2.text(0.5, 0.5, '地图数据加载失败', ha='center', va='center')
         
         # 调整布局
-        plt.tight_layout()
+        plt.subplots_adjust(left=0.15, right=0.95, top=0.95, bottom=0.05, hspace=0.3)
         
         # 保存图表
-        plt.savefig('statistics_charts.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print("统计图表已生成：statistics_charts.png")
+        plt.savefig('statistics_charts.png', dpi=300, bbox_inches='tight', pad_inches=0.5)
 
-    def create_text_image(self, text, width=1200, font_size=24):
-        """将文本转换为图片"""
-        # 设置字体
-        font = ImageFont.truetype("simhei.ttf", font_size)
-        font_small = ImageFont.truetype("simhei.ttf", font_size - 4)
-        
-        # 计算行高和边距
-        line_height = font_size * 1.5
-        padding = 40
-        
-        # 分割文本行
-        lines = text.split('\n')
-        
-        # 计算每行实际宽度和换行
-        wrapped_lines = []
-        for line in lines:
-            # 缩进处理
-            indent = len(line) - len(line.lstrip())
-            indent_space = "  " * indent
-            
-            # 处理实际内容
-            content = line.lstrip()
-            
-            # 根据内容类型设置字体和颜色
-            if content.startswith('==='):  # 主标题
-                current_font = ImageFont.truetype("simhei.ttf", font_size + 4)
-                color = '#FF6B6B'  # 主题色
-            elif content.startswith('【'):  # 分类标题
-                current_font = ImageFont.truetype("simhei.ttf", font_size + 2)
-                color = '#4ECDC4'  # 次要主题色
-            elif content.startswith('- '):  # 一级列表项
-                current_font = font
-                color = '#2C3E50'  # 深灰色
-            elif content.startswith('* '):  # 二级列表项
-                current_font = font_small
-                color = '#5D6D7E'  # 中灰色
-            else:  # 普通文本
-                current_font = font
-                color = '#34495E'  # 标准文本色
-            
-            # 处理缩进和行宽
-            if content.startswith('*'):
-                line_width = width - padding * 3
-            else:
-                line_width = width - padding * 2
-            
-            # 添加到行列表
-            wrapped_lines.append((indent_space + content, current_font, color))
-        
-        # 计算所需图片高度
-        height = int(len(wrapped_lines) * line_height + padding * 2)
-        
-        # 创建图片
-        image = Image.new('RGB', (width, height), '#FFFFFF')  # 纯白背景
-        draw = ImageDraw.Draw(image)
-        
-        # 绘制文本
-        y = padding
-        for line, line_font, color in wrapped_lines:
-            draw.text((padding, y), line, font=line_font, fill=color)
-            y += line_height
-        
-        return image
+    def get_province_coordinates(self):
+        """获取省份在地图上的大致坐标位置"""
+        return {
+            '北京': (116.4, 40.2),
+            '天津': (117.2, 39.1),
+            '河北': (115.5, 38.0),
+            '山西': (112.5, 37.8),
+            '内蒙古': (111.6, 40.8),
+            '辽宁': (123.4, 41.2),
+            '吉林': (125.3, 43.9),
+            '黑龙江': (126.6, 45.7),
+            '上海': (121.4, 31.2),
+            '江苏': (118.8, 32.0),
+            '浙江': (120.2, 30.3),
+            '安徽': (117.3, 31.8),
+            '福建': (119.3, 26.1),
+            '江西': (115.9, 28.7),
+            '山东': (117.0, 36.7),
+            '河南': (113.7, 34.8),
+            '湖北': (114.3, 30.6),
+            '湖南': (113.0, 28.2),
+            '广东': (113.3, 23.1),
+            '广西': (108.3, 22.8),
+            '海南': (110.3, 20.0),
+            '重庆': (106.5, 29.5),
+            '四川': (104.1, 30.7),
+            '贵州': (106.7, 26.6),
+            '云南': (102.7, 25.0),
+            '西藏': (91.1, 29.7),
+            '陕西': (108.9, 34.3),
+            '甘肃': (103.8, 36.0),
+            '青海': (101.8, 36.6),
+            '宁夏': (106.3, 38.5),
+            '新疆': (87.6, 43.8),
+            '台湾': (121.5, 25.0),
+            '香港': (114.2, 22.3),
+            '澳门': (113.5, 22.2),
+        }
 
     def merge_images(self, text_image, chart_image):
         """合并文本图片和统计图表"""
@@ -724,7 +983,7 @@ class WeChatGroupAnalyzer:
             f.write(text_content)
         
         # 生成统计图表
-        self.create_charts()
+        self.generate_statistics_charts()
         
         # 将文本转换为图片
         text_image = self.create_text_image(text_content)
